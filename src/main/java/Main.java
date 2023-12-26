@@ -1,38 +1,41 @@
 import java.sql.*;
-import java.util.Queue;
+import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import com.zaxxer.hikari.HikariConfig;
 import com.zaxxer.hikari.HikariDataSource;
+import java.io.IOException;
+import java.util.Properties;
 
 public class Main {
 
     private static final Logger logger = LogManager.getLogger(Main.class);
-    private static final String DB_URL = "jdbc:postgresql://localhost:5432/marmontDB";
-    private static final String DB_BENUTZERNAME = "marmontDB";
-    private static final String DB_PASSWORT = "marmontDB";
-    private static final int MAX_NACHRICHTEN = 3;
+    private static final int MAX_NACHRICHTEN = 1;
+    private static final int SCHREIBER_DELAY = 3;
+    private static final int LESER_DELAY = 1;
+    private static final int TERMINATION_DELAY = MAX_NACHRICHTEN * 5;
     private static AtomicBoolean neueNachrichtEingefuegt = new AtomicBoolean(false);
     private static Queue<Integer> geleseneNachrichtenIds = new ConcurrentLinkedQueue<>();
     private static HikariDataSource dataSource;
 
     public static void main(String[] args) {
-        initializeDataSource();
+        Properties properties = loadProperties();
+        initializeDataSource(properties);
 
         ScheduledExecutorService executor = Executors.newScheduledThreadPool(2);
 
         try {
             erstelleTabelleWennNichtVorhanden();
 
-            Runnable leserTask = Main::leseNeuesteNachrichten;
             Runnable schreiberTask = Main::schreibeNachricht;
+            Runnable leserTask = Main::leseNeuesteNachrichten;
 
-            executor.scheduleWithFixedDelay(leserTask, 0, 1, TimeUnit.SECONDS);
-            executor.scheduleWithFixedDelay(schreiberTask, 0, 3, TimeUnit.SECONDS);
+            executor.scheduleWithFixedDelay(schreiberTask, 0, SCHREIBER_DELAY, TimeUnit.SECONDS);
+            executor.scheduleWithFixedDelay(leserTask, 0, LESER_DELAY, TimeUnit.SECONDS);
 
-            executor.awaitTermination(MAX_NACHRICHTEN * 5, TimeUnit.SECONDS);
+            executor.awaitTermination(TERMINATION_DELAY, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             logger.error("Fehler im Executor-Service", e);
         } finally {
@@ -43,11 +46,21 @@ public class Main {
         }
     }
 
-    private static void initializeDataSource() {
+    private static Properties loadProperties() {
+        Properties properties = new Properties();
+        try {
+            properties.load(Main.class.getClassLoader().getResourceAsStream("db.properties"));
+        } catch (IOException e) {
+            logger.error("Fehler beim Laden der Datenbankkonfigurationsdatei", e);
+        }
+        return properties;
+    }
+
+    private static void initializeDataSource(Properties properties) {
         HikariConfig config = new HikariConfig();
-        config.setJdbcUrl(DB_URL);
-        config.setUsername(DB_BENUTZERNAME);
-        config.setPassword(DB_PASSWORT);
+        config.setJdbcUrl(properties.getProperty("db.url"));
+        config.setUsername(properties.getProperty("db.username"));
+        config.setPassword(properties.getProperty("db.password"));
         dataSource = new HikariDataSource(config);
     }
 
@@ -62,29 +75,25 @@ public class Main {
     }
 
     private static void leseNeuesteNachrichten() {
-        if (!neueNachrichtEingefuegt.get()) {
+        if (!neueNachrichtEingefuegt.getAndSet(false)) {
             return;
         }
-        String selectSQL = "SELECT * FROM nachrichten WHERE id > ?";
+        String selectSQL = "SELECT * FROM nachrichten WHERE id > ? ORDER BY id ASC LIMIT ?";
         try (Connection verbindung = dataSource.getConnection();
              PreparedStatement auswahl = verbindung.prepareStatement(selectSQL)) {
             int letzteGeleseneId = geleseneNachrichtenIds.isEmpty() ? 0 : geleseneNachrichtenIds.peek();
             auswahl.setInt(1, letzteGeleseneId);
+            auswahl.setInt(2, MAX_NACHRICHTEN);
             try (ResultSet ergebnis = auswahl.executeQuery()) {
                 while (ergebnis.next()) {
                     int id = ergebnis.getInt("id");
-                    if (!geleseneNachrichtenIds.contains(id)) {
-                        String text = ergebnis.getString("text");
-                        Timestamp zeitstempel = ergebnis.getTimestamp("zeitstempel");
-                        logger.info("Gelesene Nachricht - ID: {}, Text: {}, Zeitstempel: {}", id, text, zeitstempel);
-                        geleseneNachrichtenIds.add(id);
-                        if (geleseneNachrichtenIds.size() > MAX_NACHRICHTEN) {
-                            geleseneNachrichtenIds.poll();
-                        }
-                    }
+                    String text = ergebnis.getString("text");
+                    Timestamp zeitstempel = ergebnis.getTimestamp("zeitstempel");
+                    logger.info("Gelesene Nachricht - ID: {}, Text: {}, Zeitstempel: {}", id, text, zeitstempel);
+                    geleseneNachrichtenIds.add(id);
                 }
+                geleseneNachrichtenIds.poll();
             }
-            neueNachrichtEingefuegt.set(false);
         } catch (SQLException e) {
             logger.error("Fehler beim Lesen der neuesten Nachrichten", e);
         }
